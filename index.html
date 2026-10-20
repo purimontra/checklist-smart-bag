@@ -66,6 +66,8 @@ h1,h2,h3,.logo,.cnt,.mn b,.btn,nav button,.tabs button,.ch{font-family:Mali,"Not
 </head>
 <body>
 <div id="root"></div><div id="toast"></div>
+<script src="https://www.gstatic.com/firebasejs/10.12.5/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.5/firebase-database-compat.js"></script>
 <script>
 const K='smartbag_v3',TC='1234'; // รหัสสมัครคุณครู
 const $=s=>document.querySelector(s);
@@ -76,11 +78,55 @@ const LEVELS=['ป.1','ป.2','ป.3'],rooms=()=>Array.from({length:Math.max(8,d
 const PETS=['🐻','🦊','🐰','🐼','🐨','🐯'];
 const pet=u=>PETS[[...u].reduce((a,c)=>a+c.charCodeAt(0),0)%6];
 const LV=[[0,'ดาวน้อย','🌱'],[10,'ดาวเด่น','🌟'],[25,'ดาวเงิน','🥈'],[50,'ดาวทอง','🥇']],level=n=>LV.filter(l=>n>=l[0]).pop();
-function load(){let d=null;try{d=JSON.parse(localStorage.getItem(K))}catch(e){}db=d||{};['users','asg','notifs'].forEach(k=>db[k]=db[k]||[]);db.subjects=db.subjects||DEFAULT_SUBJ.map(x=>[...x]);['checks','log','seen'].forEach(k=>db[k]=db[k]||{})}
-let db;load();
-const save=()=>{try{localStorage.setItem(K,JSON.stringify(db))}catch(e){toast('พื้นที่จัดเก็บเต็ม ลองใช้ภาพขนาดเล็กลง')}};
+// Shared demo database. Every write is a Firebase transaction; no shared data is saved locally.
+const FIREBASE_URL='https://checklist-smart-bag-default-rtdb.asia-southeast1.firebasedatabase.app/';
+firebase.initializeApp({databaseURL:FIREBASE_URL,projectId:'checklist-smart-bag'});
+const rootRef=firebase.database().ref('smartbag_demo_v1');
+const defaults=()=>({users:[],asg:[],notifs:[],subjects:DEFAULT_SUBJ.map(x=>[...x]),checks:{},log:{},seen:{},maxRoom:8});
+const normalize=d=>{d=d||{};const z=defaults();for(const k of Object.keys(z))if(d[k]==null)d[k]=z[k];for(const k of ['users','asg','notifs','subjects'])if(!Array.isArray(d[k]))d[k]=Object.values(d[k]||{});return d};
+let db=defaults(),baseline=structuredClone(db),ready=false,pending=0,writeQueue=Promise.resolve();
+function load(){return db} // Login uses the live Firebase snapshot.
+const same=(a,b)=>JSON.stringify(a)===JSON.stringify(b);
+// Merge only changed fields; array records are matched by stable IDs instead of replacing lists.
+function mergeDelta(base,edited,remote,path=''){
+ if(same(base,edited))return remote;
+ if(Array.isArray(edited)&&Array.isArray(base)){
+  const key=path==='subjects'?x=>x[0]:x=>x&&x.id!==undefined?x.id:x&&x.username!==undefined?x.username:null;
+  if(edited.every(x=>key(x)!=null)&&base.every(x=>key(x)!=null)){
+   let out=Array.isArray(remote)?structuredClone(remote):[];
+   for(const old of base){if(!edited.some(x=>key(x)===key(old)))out=out.filter(x=>key(x)!==key(old))}
+   for(const item of edited){const old=base.find(x=>key(x)===key(item)),idx=out.findIndex(x=>key(x)===key(item));if(old===undefined){if(idx<0)out.push(item)}else if(!same(old,item)){if(idx>=0)out[idx]=mergeDelta(old,item,out[idx],path+'/*');}}
+   return out;
+  }
+  return edited;
+ }
+ if(edited&&typeof edited==='object'&&!Array.isArray(edited)&&base&&typeof base==='object'&&!Array.isArray(base)){
+  const out=remote&&typeof remote==='object'&&!Array.isArray(remote)?structuredClone(remote):{};
+  for(const k of new Set([...Object.keys(base),...Object.keys(edited)])){
+   if(!(k in edited)){delete out[k];continue}
+   if(!(k in base)){if(!(k in out))out[k]=edited[k];else if(!same(out[k],edited[k]))out[k]=mergeDelta({},edited[k],out[k],path+'/'+k)}
+   else if(!same(base[k],edited[k]))out[k]=mergeDelta(base[k],edited[k],out[k],path+'/'+k);
+  }return out;
+ }
+ return edited;
+}
+function save(){
+ const before=structuredClone(baseline),after=structuredClone(db);
+ baseline=structuredClone(after);pending++;
+ writeQueue=writeQueue.catch(()=>{}).then(()=>new Promise((resolve,reject)=>{
+  rootRef.transaction(current=>mergeDelta(before,after,normalize(current)),(error,committed,snapshot)=>{
+   pending--;if(error||!committed){toast('บันทึกข้อมูลไม่สำเร็จ กรุณาตรวจสอบการเชื่อมต่อ');reject(error||Error('Transaction cancelled'));return}
+   if(!pending){db=normalize(snapshot.val());baseline=structuredClone(db);refreshUser();render()}
+   resolve();
+  },false);
+ }));return writeQueue;
+}
+function refreshUser(){if(me)me=db.users.find(u=>u.username===me.username)||null}
+rootRef.on('value',snap=>{if(pending)return;db=normalize(snap.val());baseline=structuredClone(db);ready=true;refreshUser();render()},err=>{ready=false;document.querySelector('#root').textContent='เชื่อมต่อ Firebase ไม่สำเร็จ: '+err.message});
 let me=null,view='home',mode='landing',sel=null,sum={},add={items:[]},draftImg='',cm=new Date();
-try{me=db.users.find(u=>u.username===localStorage.getItem(K+'_s'))||null}catch(e){}
+let sessionName=null;try{sessionName=localStorage.getItem(K+'_s')}catch(e){}
+// Restore the local session only after the remote users have loaded.
+const oldRefreshUser=refreshUser;refreshUser=function(){if(!me&&sessionName)me=db.users.find(u=>u.username===sessionName)||null;else oldRefreshUser()};
 const today=()=>new Date().toLocaleDateString('sv-SE');
 const thDate=d=>new Date(d+'T00:00').toLocaleDateString(LOC(),{day:'numeric',month:'short',year:'numeric'});
 async function hash(s){try{const b=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(s));return [...new Uint8Array(b)].map(x=>x.toString(16).padStart(2,'0')).join('')}catch(e){return btoa(unescape(encodeURIComponent(s)))}}
@@ -110,7 +156,7 @@ function trDom(el){if(lang!=='en')return;const w=document.createTreeWalker(el,No
  el.querySelectorAll('[placeholder],[aria-label],[alt]').forEach(e=>['placeholder','aria-label','alt'].forEach(a=>{if(e.hasAttribute(a))e.setAttribute(a,tr(e.getAttribute(a)))}))}
 function toast(m){const t=$('#toast');t.textContent=tr(m);t.classList.add('show');clearTimeout(toast.t);toast.t=setTimeout(()=>t.classList.remove('show'),2800)}
 function boom(){const e=['⭐','🌟','✨','🌼','🍂'];for(let i=0;i<24;i++){const s=document.createElement('span');s.className='cf';s.textContent=e[i%5];s.style.cssText=`left:${Math.random()*100}vw;animation-delay:${Math.random()*.6}s;font-size:${18+Math.random()*18}px`;document.body.appendChild(s);setTimeout(()=>s.remove(),2800)}}
-window.addEventListener('storage',e=>{if(e.key===K){load();if(me&&me.role==='student')toast('🔔 มีรายการใหม่จากคุณครู');render()}});
+// Realtime Database listener above synchronizes all devices.
 
 /* ---- data helpers ---- */
 const isDone=(u,a,i)=>!!(db.checks[u]&&db.checks[u][a]&&db.checks[u][a][i]);
@@ -189,15 +235,15 @@ function setA(k,v){const o=['subj','level','room','date'];add[k]=k==='room'?+v:v
 function addRoom(){db.maxRoom=Math.max(8,db.maxRoom||8)+1;save();render();toast('เพิ่มห้อง '+db.maxRoom+' แล้ว')}
 function mv(d){cm=new Date(cm.getFullYear(),cm.getMonth()+d,1);render()}
 function pick(inp){const f=inp.files[0];if(!f)return;const r=new FileReader();r.onload=()=>{const im=new Image();im.onload=()=>{const s=Math.min(1,360/im.width),c=document.createElement('canvas');c.width=im.width*s;c.height=im.height*s;c.getContext('2d').drawImage(im,0,0,c.width,c.height);draftImg=c.toDataURL('image/jpeg',.7);const p=$('#pv');p.src=draftImg;p.style.display='block'};im.src=r.result};r.readAsDataURL(f)}
-function draft(){const n=$('#in').value.trim();if(!n)return toast('กรุณาระบุชื่ออุปกรณ์');add.st=$('#st')?$('#st').value:add.st;add.items.push({id:'t'+Date.now(),name:n,img:draftImg});draftImg='';render()}
+function draft(){const n=$('#in').value.trim();if(!n)return toast('กรุณาระบุชื่ออุปกรณ์');add.st=$('#st')?$('#st').value:add.st;add.items.push({id:'t'+crypto.randomUUID(),name:n,img:draftImg});draftImg='';render()}
 function undraft(i){add.items.splice(i,1);render()}
 function publish(){
  const st=+$('#st').value,n=$('#in')&&$('#in').value.trim();if(n){add.st=st;draft()}
  if(!add.items.length)return toast('เพิ่มรายการอย่างน้อย 1 รายการ');
  if(!(st>=1&&st<=10))return toast('จำนวนดาว 1-10 ดวง');
  let a=db.asg.find(x=>x.tid===me.username&&x.subj===add.subj&&x.level===add.level&&x.room===add.room&&x.date===add.date);
- if(a){a.items=a.items.concat(add.items);a.stars=st}else{a={id:'a'+Date.now(),tid:me.username,t:me.name,subj:add.subj,level:add.level,room:add.room,date:add.date,stars:st,items:add.items};db.asg.push(a)}
- db.notifs.push({id:'n'+Date.now(),t:me.name,subj:add.subj,level:add.level,room:add.room,date:add.date});
+ if(a){a.items=a.items.concat(add.items);a.stars=st}else{a={id:'a'+crypto.randomUUID(),tid:me.username,t:me.name,subj:add.subj,level:add.level,room:add.room,date:add.date,stars:st,items:add.items};db.asg.push(a)}
+ db.notifs.push({id:'n'+crypto.randomUUID(),t:me.name,subj:add.subj,level:add.level,room:add.room,date:add.date});
  save();toast('ส่งแจ้งเตือนถึงนักเรียน '+add.level+'/'+add.room+' แล้ว');add={items:[]};view='home';render();
 }
 function tAdd(){
